@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_load_example_config():
     config = load_config(ROOT / "config.yaml")
+    assert config.server.host == "0.0.0.0"
     assert config.prompt_enhancer.model == "ministral-3-8b-instruct-2512"
     assert config.prompt_enhancer.base_url == "http://192.168.2.117:1234/v1"
     assert config.model.repo_id == "Lightricks/LTX-2.5-Diffusers"
