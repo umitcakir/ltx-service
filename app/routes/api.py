@@ -73,7 +73,7 @@ def get_result(job_id: str, request: Request):
     path = Path(state.result.output_path)
     if not path.is_file():
         raise HTTPException(404, detail="result file no longer exists")
-    return FileResponse(path, filename=state.result.filename, media_type="video/mp4")
+    return FileResponse(path, filename=state.result.filename, media_type="video/mp4", content_disposition_type="inline")
 
 
 @router.delete("/jobs/{job_id}", response_model=JobStatusResponse)

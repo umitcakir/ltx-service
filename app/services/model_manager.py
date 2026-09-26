@@ -124,6 +124,8 @@ class ModelManager:
 
         if model_cfg.vae_tiling and hasattr(pipeline, "vae"):
             pipeline.vae.enable_tiling()
+            if hasattr(pipeline.vae, "use_framewise_decoding"):
+                pipeline.vae.use_framewise_decoding = True
         if model_cfg.vae_slicing and hasattr(pipeline.vae, "enable_slicing"):
             pipeline.vae.enable_slicing()
 

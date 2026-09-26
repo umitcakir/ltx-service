@@ -1,5 +1,9 @@
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
+import shutil
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -10,9 +14,12 @@ from pydantic import ValidationError
 from app.config import ConfigError, PromptEnhancerConfig, load_config
 from app.main import create_app
 from app.models.requests import GenerateRequest
+from app.models.responses import JobStatus
 from app.services.jobs import validate_request
+from app.services.model_manager import ModelManager
 from app.services.prompt_enhancer import enhance_prompt
 from app.utils.paths import OutputPathError, resolve_output_path
+from app.utils.videos import make_faststart
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +74,22 @@ def test_config_boundaries():
         validate_request(GenerateRequest(prompt="cat", start_image_url="https://example.org/a.png"), config)
 
 
+def test_model_load_enables_temporal_vae_tiling(monkeypatch, tmp_path):
+    config = load_config(ROOT / "config.yaml")
+    config.model.enable_latent_upsampler = False
+    vae = SimpleNamespace(use_framewise_decoding=False, enable_tiling=lambda: None, enable_slicing=lambda: None)
+    pipeline = SimpleNamespace(vae=vae, enable_sequential_cpu_offload=lambda: None)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "diffusers", SimpleNamespace(LTX2Pipeline=SimpleNamespace(from_pretrained=lambda *args, **kwargs: pipeline)))
+    monkeypatch.setattr("app.services.model_manager.resolve_dtype", lambda precision: precision)
+    monkeypatch.setattr(ModelManager, "_ensure_checkpoint", lambda self: tmp_path)
+    monkeypatch.setattr(ModelManager, "_load_sigma_schedules", staticmethod(lambda: {}))
+
+    manager = ModelManager(config)
+    manager.load()
+    assert vae.use_framewise_decoding is True
+
+
 def test_output_path_and_symlink_escape(tmp_path):
     from app.config import StorageConfig
 
@@ -85,6 +108,19 @@ def test_output_path_and_symlink_escape(tmp_path):
     (root / "redirect").symlink_to(escape, target_is_directory=True)
     with pytest.raises(OutputPathError):
         resolve_output_path(storage, filename="scene.mp4")
+
+
+def test_faststart_mp4(tmp_path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is required for video encoding")
+    path = tmp_path / "sample.mp4"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=s=32x32:r=1", "-t", "1", "-c:v", "mpeg4", str(path)],
+        check=True,
+    )
+    assert path.read_bytes().index(b"mdat") < path.read_bytes().index(b"moov")
+    make_faststart(path)
+    assert path.read_bytes().index(b"moov") < path.read_bytes().index(b"mdat")
 
 
 def test_remote_prompt_enhancement(monkeypatch):
@@ -148,3 +184,19 @@ def test_endpoints_without_authentication(tmp_path):
         assert client.get(f"/jobs/{job_id}/result").status_code == 409
         invalid = client.post("/generate", json={"prompt": "cat", "output_filename": "../escape.mp4"})
         assert invalid.status_code == 422
+
+
+def test_completed_result_streams_inline(tmp_path):
+    config = load_config(ROOT / "config.yaml")
+    config.logging.dir = tmp_path / "logs"
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"0123456789")
+    with TestClient(create_app(config, model=FakeModel())) as client:
+        client.app.state.jobs.get = lambda job_id: SimpleNamespace(
+            status=JobStatus.COMPLETED, result=SimpleNamespace(output_path=str(video), filename=video.name)
+        )
+        response = client.get("/jobs/example/result", headers={"Range": "bytes=0-3"})
+        assert response.status_code == 206
+        assert response.content == b"0123"
+        assert response.headers["content-type"] == "video/mp4"
+        assert response.headers["content-disposition"].startswith("inline;")

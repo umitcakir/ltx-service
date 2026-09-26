@@ -195,6 +195,9 @@ class JobManager:
                     audio=generated.audio.float().cpu() if generated.audio is not None else None,
                     audio_sample_rate=generated.audio_sample_rate if generated.audio is not None else None,
                 )
+                from app.utils.videos import make_faststart
+
+                make_faststart(output_path)
                 duration = duration_for_frames(generated.num_frames, fps)
                 state.result = JobResult(
                     output_path=str(output_path), filename=filename, format=output_path.suffix.lstrip("."),

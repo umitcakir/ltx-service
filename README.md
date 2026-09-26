@@ -9,6 +9,8 @@ FastAPI wrapper around the **Diffusers** LTX-2.5 pack. No containers. One Uvicor
 - The `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` file you already have is a **transformer**, not a LoRA and not a complete Diffusers pipeline. The service downloads the compatible Diffusers pack (`transformer/` + Gemma-4 encoder + VAE + audio components); it cannot load that split checkpoint alone. Do not put the transformer file in `loras[].path`.
 - A bf16 22B transformer plus text encoder does **not** fit wholly in 16 GB of VRAM. `cpu_offload: sequential` streams weights from RAM; tiling/slicing is enabled. Long 720p jobs may be slow and can exceed 32 GB RAM. Set `max_concurrent_jobs: 2` only after measuring peak RAM/VRAM locally. The service does not perform custom VRAM budget checks.
 
+If a job reaches 100% denoising but reports `CUDA_OOM`, the VAE may still be decoding the video. Spatial and temporal VAE tiling are enabled when `model.vae_tiling` is true, but they cannot guarantee a long clip will fit alongside other GPU processes. Check `nvidia-smi` on the inference host before retrying, stop other GPU workloads you control, or use a shorter clip. The logged `peak_vram` is this process's PyTorch measurement, not total GPU usage.
+
 ## Setup
 
 Windows PowerShell (Python 3.12 installed):
@@ -52,6 +54,8 @@ curl -X POST http://127.0.0.1:8000/generate -H 'Content-Type: application/json' 
 The upload endpoint accepts PNG, JPEG, WebP and BMP up to `generation.max_image_download_bytes` and stores files in `generation.input_image_dir`; uploaded images persist until removed. Alternatively put `first.jpg` in that directory yourself and send `"start_image_path": "first.jpg"`, or use `"start_image_url": "https://..."` for a publicly accessible image (private/LAN URLs are rejected). Add an `end_image_path` or `end_image_url` for first/last-frame video. `generation.allow_remote_images` controls URL fetching, not uploads. `duration: null` (or omitted) lets the LTX-2.5 duration head choose within the configured 1–20 second bounds. Only 24/25 fps and 480p (832x480) / 720p (1280x704) landscape and portrait equivalents are supported; frame count is snapped to `8k+1`. `quality` selects the two-stage distilled pass at 720p. At 480p it falls back to the single-stage distilled pass because 832x480 cannot be halved onto the model's 32-pixel grid. This is **not** the full/SFT transformer quality mode; that requires downloading and loading another large transformer.
 
 `POST /generate` immediately returns a queued job ID. `GET /jobs/{id}` reports status, progress, error or finished file path and metadata; `GET /jobs/{id}/result` streams the MP4. `DELETE /jobs/{id}` cancels queued jobs only. Jobs and queue live in memory, so a restart loses job records (completed files remain). Inference timeouts are checked during denoising and before encoding; a stalled CUDA kernel cannot safely be killed from Python. Shutdown waits for active jobs to finish.
+
+Generated MP4s are losslessly finalised with the index at the front for progressive browser playback. The result endpoint serves `video/mp4` inline and supports HTTP byte ranges. If another service copies files into a separate video directory, it must also serve them with the correct MIME type and byte-range support; that service's headers and caching are independent of this API.
 
 ## LAN Prompt Enhancer
 
