@@ -1,7 +1,6 @@
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-import shutil
 import subprocess
 import sys
 
@@ -10,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import ValidationError
+from imageio_ffmpeg import get_ffmpeg_exe
 
 from app.config import ConfigError, PromptEnhancerConfig, load_config
 from app.main import create_app
@@ -110,15 +110,14 @@ def test_output_path_and_symlink_escape(tmp_path):
         resolve_output_path(storage, filename="scene.mp4")
 
 
-def test_faststart_mp4(tmp_path):
-    if shutil.which("ffmpeg") is None:
-        pytest.skip("ffmpeg is required for video encoding")
+def test_faststart_mp4(tmp_path, monkeypatch):
     path = tmp_path / "sample.mp4"
     subprocess.run(
-        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=s=32x32:r=1", "-t", "1", "-c:v", "mpeg4", str(path)],
+        [get_ffmpeg_exe(), "-loglevel", "error", "-f", "lavfi", "-i", "color=s=32x32:r=1", "-t", "1", "-c:v", "mpeg4", str(path)],
         check=True,
     )
     assert path.read_bytes().index(b"mdat") < path.read_bytes().index(b"moov")
+    monkeypatch.setenv("PATH", "")
     make_faststart(path)
     assert path.read_bytes().index(b"moov") < path.read_bytes().index(b"mdat")
 
