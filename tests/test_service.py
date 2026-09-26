@@ -1,8 +1,10 @@
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 from pydantic import ValidationError
 
 from app.config import ConfigError, PromptEnhancerConfig, load_config
@@ -110,6 +112,24 @@ class FakeModel:
 
     def generate(self, *args, **kwargs):
         raise RuntimeError("test model has no inference")
+
+
+def test_image_upload_for_generation(tmp_path):
+    config = load_config(ROOT / "config.yaml")
+    config.generation.input_image_dir = tmp_path / "inputs"
+    config.generation.max_image_download_bytes = 1024
+    config.logging.dir = tmp_path / "logs"
+    image_data = BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image_data, format="PNG")
+    with TestClient(create_app(config, model=FakeModel())) as client:
+        response = client.post("/images", content=image_data.getvalue(), headers={"content-type": "image/png"})
+        assert response.status_code == 201
+        filename = response.json()["path"]
+        assert (config.generation.input_image_dir / filename).read_bytes() == image_data.getvalue()
+        assert client.post("/generate", json={"prompt": "cat", "start_image_path": filename}).status_code == 202
+        assert client.post("/images", content=b"not an image").status_code == 422
+        assert client.post("/images", content=b"x" * 1025).status_code == 413
+        assert list(config.generation.input_image_dir.iterdir()) == [config.generation.input_image_dir / filename]
 
 
 def test_endpoints_without_authentication(tmp_path):

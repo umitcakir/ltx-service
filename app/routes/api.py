@@ -1,16 +1,43 @@
 """REST endpoints."""
 
 import asyncio
+from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
+from PIL import Image, UnidentifiedImageError
 
 from app import __version__
 from app.models import GenerateRequest, GenerateResponse, HealthResponse, JobStatus, JobStatusResponse, LoraListResponse, LoraProfileInfo
 from app.utils.gpu import vram_snapshot
 
 router = APIRouter()
+
+
+@router.post("/images", status_code=201)
+async def upload_image(request: Request):
+    config = request.app.state.config.generation
+    limit = config.max_image_download_bytes
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > limit:
+            raise HTTPException(413, detail=f"image exceeds the configured limit of {limit} bytes")
+    try:
+        with Image.open(BytesIO(data)) as image:
+            image.load()
+            extension = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp", "BMP": "bmp"}.get(image.format)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(422, detail="not a valid image") from exc
+    if extension is None:
+        raise HTTPException(422, detail="unsupported image format")
+    root = config.input_image_dir
+    root.mkdir(parents=True, exist_ok=True)
+    filename = f"uploaded-{uuid4().hex}.{extension}"
+    (root / filename).write_bytes(data)
+    return {"path": filename}
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
