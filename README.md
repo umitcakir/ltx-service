@@ -64,7 +64,7 @@ Poll `GET /jobs/{id}` until `status` is `completed`, then download with `GET /jo
 
 Generated MP4s are losslessly finalised with the index at the front for progressive browser playback. The result endpoint serves `video/mp4` inline and supports HTTP byte ranges. If another service copies files into a separate video directory, it must also serve them with the correct MIME type and byte-range support; that service's headers and caching are independent of this API.
 
-Each job writes to `logs/jobs/<job_id>.log` and the service log. Completed jobs log elapsed seconds and expose the same value as `result.generation_time_seconds` via `GET /jobs/{id}`; failed jobs also log elapsed seconds. This measures job execution through encoding and MP4 finalisation, not time spent waiting in the queue or client download time.
+Each job writes to `logs/jobs/<job_id>.log` and the service log. Completed and failed jobs log elapsed time in minutes and seconds (for example, `4m 29.081s`). Completed jobs also expose a numeric `result.generation_time_seconds` via `GET /jobs/{id}`. This measures job execution through encoding and MP4 finalisation, not time spent waiting in the queue or client download time.
 
 ## LAN Prompt Enhancer
 

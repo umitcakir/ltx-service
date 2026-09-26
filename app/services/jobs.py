@@ -23,6 +23,11 @@ from app.utils.paths import OutputPathError, build_filename, resolve_input_image
 log = logging.getLogger(__name__)
 
 
+def format_elapsed(seconds: float) -> str:
+    minutes, remaining_seconds = divmod(seconds, 60)
+    return f"{int(minutes)}m {remaining_seconds:06.3f}s"
+
+
 class JobBusyError(Exception):
     pass
 
@@ -222,7 +227,7 @@ class JobManager:
                 state.status = JobStatus.COMPLETED
                 state.progress = 1.0
                 state.stage = "completed"
-                job_log.info("completed in %.3fs peak_vram=%s path=%s", state.result.generation_time_seconds, state.result.peak_vram_bytes, output_path)
+                job_log.info("completed in %s peak_vram=%s path=%s", format_elapsed(state.result.generation_time_seconds), state.result.peak_vram_bytes, output_path)
             except Exception as exc:
                 if output_path is not None and output_path.is_file():
                     output_path.unlink(missing_ok=True)
@@ -235,6 +240,6 @@ class JobManager:
                     state.status, code = JobStatus.FAILED, "GENERATION_FAILED"
                 state.stage = "failed"
                 state.error = JobError(code=code, message=str(exc)[:500])
-                job_log.exception("job failed: %s elapsed=%.3fs (peak_vram=%s)", code, time.monotonic() - started, peak_vram_bytes())
+                job_log.exception("job failed: %s elapsed=%s (peak_vram=%s)", code, format_elapsed(time.monotonic() - started), peak_vram_bytes())
             finally:
                 state.finished_at = utcnow()

@@ -16,7 +16,7 @@ from app.config import ConfigError, PromptEnhancerConfig, load_config
 from app.main import create_app
 from app.models.requests import GenerateRequest
 from app.models.responses import JobResult, JobStatus, JobStatusResponse
-from app.services.jobs import Job, JobBusyError, JobManager, utcnow, validate_request
+from app.services.jobs import Job, JobBusyError, JobManager, format_elapsed, utcnow, validate_request
 from app.services.model_manager import ModelManager
 from app.services.model_manager import GenerationOutput
 from app.services.prompt_enhancer import enhance_prompt
@@ -254,9 +254,14 @@ def test_completed_job_logs_result_duration(tmp_path, monkeypatch, caplog):
 
     assert state.status == JobStatus.COMPLETED
     assert state.result is not None
-    assert f"completed in {state.result.generation_time_seconds:.3f}s" in (
+    assert f"completed in {format_elapsed(state.result.generation_time_seconds)}" in (
         config.logging.dir / "jobs/timed.log"
     ).read_text()
+
+
+def test_elapsed_log_format():
+    assert format_elapsed(269.081) == "4m 29.081s"
+    assert format_elapsed(9.5) == "0m 09.500s"
 
 
 def test_completed_result_streams_inline(tmp_path):
