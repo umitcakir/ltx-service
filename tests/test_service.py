@@ -1,6 +1,7 @@
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 import subprocess
 import sys
 
@@ -14,9 +15,10 @@ from imageio_ffmpeg import get_ffmpeg_exe
 from app.config import ConfigError, PromptEnhancerConfig, load_config
 from app.main import create_app
 from app.models.requests import GenerateRequest
-from app.models.responses import JobStatus
-from app.services.jobs import validate_request
+from app.models.responses import JobResult, JobStatus, JobStatusResponse
+from app.services.jobs import Job, JobBusyError, JobManager, utcnow, validate_request
 from app.services.model_manager import ModelManager
+from app.services.model_manager import GenerationOutput
 from app.services.prompt_enhancer import enhance_prompt
 from app.utils.paths import OutputPathError, resolve_output_path
 from app.utils.videos import make_faststart
@@ -72,6 +74,20 @@ def test_config_boundaries():
     config.generation.allow_remote_images = False
     with pytest.raises(ValueError, match="remote conditioning"):
         validate_request(GenerateRequest(prompt="cat", start_image_url="https://example.org/a.png"), config)
+
+
+def test_reject_when_busy_queued_and_cancelled():
+    config = load_config(ROOT / "config.yaml")
+    manager = JobManager(config, FakeModel())
+    first = manager.submit(GenerateRequest(prompt="first"))
+    with pytest.raises(JobBusyError, match="another generation is in progress"):
+        manager.submit(GenerateRequest(prompt="second"))
+    assert len(manager.jobs) == 1
+    manager.cancel(first.job_id)
+    manager.submit(GenerateRequest(prompt="third"))
+    config.runtime.reject_when_busy = False
+    manager.submit(GenerateRequest(prompt="fourth"))
+    assert len(manager.jobs) == 3
 
 
 def test_model_load_enables_temporal_vae_tiling(monkeypatch, tmp_path):
@@ -185,6 +201,64 @@ def test_endpoints_without_authentication(tmp_path):
         assert invalid.status_code == 422
 
 
+def test_generate_rejects_during_running_job(tmp_path):
+    config = load_config(ROOT / "config.yaml")
+    config.logging.dir = tmp_path / "logs"
+    with TestClient(create_app(config, model=FakeModel())) as client:
+        manager = client.app.state.jobs
+        running = JobStatusResponse(job_id="existing", status=JobStatus.RUNNING, progress=0.5, created_at=utcnow())
+        manager.jobs[running.job_id] = Job(GenerateRequest(prompt="first"), running)
+        response = client.post("/generate", json={"prompt": "second"})
+        assert response.status_code == 429
+        assert response.json()["detail"] == "another generation is in progress"
+        assert len(manager.jobs) == 1
+        running.status = JobStatus.COMPLETED
+        assert client.post("/generate", json={"prompt": "third"}).status_code == 202
+
+
+def test_failed_job_logs_elapsed_time(tmp_path, caplog):
+    config = load_config(ROOT / "config.yaml")
+    config.logging.dir = tmp_path / "logs"
+    config.storage.default_output_dir = tmp_path / "outputs"
+    config.storage.allowed_output_dirs = [tmp_path / "outputs"]
+    state = JobStatusResponse(job_id="timed", status=JobStatus.RUNNING, progress=0, created_at=utcnow())
+    manager = JobManager(config, FakeModel())
+
+    manager._execute(Job(GenerateRequest(prompt="cat"), state))
+
+    assert state.status == JobStatus.FAILED
+    assert "job failed: GENERATION_FAILED elapsed=" in caplog.text
+    assert "elapsed=" in (config.logging.dir / "jobs/timed.log").read_text()
+
+
+def test_completed_job_logs_result_duration(tmp_path, monkeypatch, caplog):
+    config = load_config(ROOT / "config.yaml")
+    config.logging.dir = tmp_path / "logs"
+    config.storage.default_output_dir = tmp_path / "outputs"
+    config.storage.allowed_output_dirs = [tmp_path / "outputs"]
+    model = FakeModel()
+    model.generate = lambda *args: GenerationOutput(
+        video=[], audio=None, audio_sample_rate=None, num_frames=25, width=832, height=480
+    )
+    diffusers = ModuleType("diffusers")
+    diffusers.__path__ = []
+    utils = ModuleType("diffusers.utils")
+    utils.encode_video = lambda video, fps, output_path, **kwargs: Path(output_path).write_bytes(b"mp4")
+    monkeypatch.setitem(sys.modules, "diffusers", diffusers)
+    monkeypatch.setitem(sys.modules, "diffusers.utils", utils)
+    monkeypatch.setattr("app.utils.videos.make_faststart", lambda path: None)
+    state = JobStatusResponse(job_id="timed", status=JobStatus.RUNNING, progress=0, created_at=utcnow())
+
+    with caplog.at_level("INFO", logger="ltx.job.timed"):
+        JobManager(config, model)._execute(Job(GenerateRequest(prompt="cat"), state))
+
+    assert state.status == JobStatus.COMPLETED
+    assert state.result is not None
+    assert f"completed in {state.result.generation_time_seconds:.3f}s" in (
+        config.logging.dir / "jobs/timed.log"
+    ).read_text()
+
+
 def test_completed_result_streams_inline(tmp_path):
     config = load_config(ROOT / "config.yaml")
     config.logging.dir = tmp_path / "logs"
@@ -192,10 +266,52 @@ def test_completed_result_streams_inline(tmp_path):
     video.write_bytes(b"0123456789")
     with TestClient(create_app(config, model=FakeModel())) as client:
         client.app.state.jobs.get = lambda job_id: SimpleNamespace(
-            status=JobStatus.COMPLETED, result=SimpleNamespace(output_path=str(video), filename=video.name)
+            status=JobStatus.COMPLETED, stage=None,
+            result=SimpleNamespace(output_path=str(video), filename=video.name)
         )
         response = client.get("/jobs/example/result", headers={"Range": "bytes=0-3"})
         assert response.status_code == 206
         assert response.content == b"0123"
         assert response.headers["content-type"] == "video/mp4"
         assert response.headers["content-disposition"].startswith("inline;")
+
+
+def test_delete_result_after_download(tmp_path):
+    config = load_config(ROOT / "config.yaml")
+    config.logging.dir = tmp_path / "logs"
+    config.storage.default_output_dir = tmp_path / "outputs"
+    config.storage.allowed_output_dirs = [tmp_path / "outputs"]
+    config.storage.default_output_dir.mkdir()
+    video = config.storage.default_output_dir / "clip.mp4"
+    video.write_bytes(b"video")
+    with TestClient(create_app(config, model=FakeModel())) as client:
+        state = JobStatusResponse(job_id="done", status=JobStatus.COMPLETED, progress=1, created_at=utcnow())
+        state.result = JobResult(
+            output_path=str(video), filename=video.name, format="mp4", file_size_bytes=5,
+            resolution="480p", width=832, height=480, aspect_ratio="16:9", duration_seconds=1,
+            num_frames=25, fps=24, seed=1, lora=None, lora_weight=None,
+            num_inference_steps=8, guidance_scale=1, multi_stage=False, audio=False,
+            generation_time_seconds=1,
+        )
+        client.app.state.jobs.jobs[state.job_id] = Job(GenerateRequest(prompt="first"), state)
+        state.status = JobStatus.RUNNING
+        assert client.delete("/jobs/done/result").status_code == 409
+        state.status = JobStatus.COMPLETED
+        outside = tmp_path / "outside.mp4"
+        outside.write_bytes(b"keep")
+        state.result.output_path = str(outside)
+        assert client.delete("/jobs/done/result").status_code == 409
+        assert outside.read_bytes() == b"keep"
+        link = config.storage.default_output_dir / "link.mp4"
+        link.symlink_to(outside)
+        state.result.output_path, state.result.filename = str(link), link.name
+        assert client.delete("/jobs/done/result").status_code == 409
+        assert link.is_symlink()
+        state.result.output_path, state.result.filename = str(video), video.name
+        assert client.get("/jobs/done/result").content == b"video"
+        assert client.delete("/jobs/done/result").status_code == 204
+        assert not video.exists()
+        assert client.delete("/jobs/done/result").status_code == 204
+        assert client.get("/jobs/done/result").status_code == 410
+        assert client.get("/jobs/done").json()["stage"] == "result_deleted"
+        assert client.get("/jobs/done").json()["result"] is None

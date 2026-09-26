@@ -215,6 +215,7 @@ class RuntimeConfig(BaseModel):
 
     #: GPU job semaphore. 1 is safe; 2 is viable for 480p/720p with headroom.
     max_concurrent_jobs: int = Field(default=1, ge=1, le=8)
+    reject_when_busy: bool = True
     job_timeout_seconds: float = Field(default=1800.0, gt=0)
     max_queue_size: int = Field(default=32, ge=1)
     #: How long finished jobs stay queryable via /jobs/{id}.

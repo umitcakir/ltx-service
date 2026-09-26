@@ -23,6 +23,10 @@ from app.utils.paths import OutputPathError, build_filename, resolve_input_image
 log = logging.getLogger(__name__)
 
 
+class JobBusyError(Exception):
+    pass
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -81,6 +85,10 @@ class JobManager:
         if self.closing:
             raise RuntimeError("server is shutting down")
         validate_request(request, self.config)
+        if self.config.runtime.reject_when_busy and any(
+            job.state.status in (JobStatus.QUEUED, JobStatus.RUNNING) for job in self.jobs.values()
+        ):
+            raise JobBusyError("another generation is in progress")
         job_id = uuid.uuid4().hex
         state = JobStatusResponse(job_id=job_id, status=JobStatus.QUEUED, progress=0, stage="queued", created_at=utcnow())
         self.queue.put_nowait(job_id)
@@ -214,7 +222,7 @@ class JobManager:
                 state.status = JobStatus.COMPLETED
                 state.progress = 1.0
                 state.stage = "completed"
-                job_log.info("completed in %.2fs peak_vram=%s path=%s", time.monotonic() - started, state.result.peak_vram_bytes, output_path)
+                job_log.info("completed in %.3fs peak_vram=%s path=%s", state.result.generation_time_seconds, state.result.peak_vram_bytes, output_path)
             except Exception as exc:
                 if output_path is not None and output_path.is_file():
                     output_path.unlink(missing_ok=True)
@@ -227,6 +235,6 @@ class JobManager:
                     state.status, code = JobStatus.FAILED, "GENERATION_FAILED"
                 state.stage = "failed"
                 state.error = JobError(code=code, message=str(exc)[:500])
-                job_log.exception("job failed: %s (peak_vram=%s)", code, peak_vram_bytes())
+                job_log.exception("job failed: %s elapsed=%.3fs (peak_vram=%s)", code, time.monotonic() - started, peak_vram_bytes())
             finally:
                 state.finished_at = utcnow()

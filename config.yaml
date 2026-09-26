@@ -55,6 +55,7 @@ loras:
 
 runtime:
   max_concurrent_jobs: 1
+  reject_when_busy: true
   job_timeout_seconds: 1800
   max_queue_size: 32
 

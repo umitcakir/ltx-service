@@ -11,6 +11,7 @@ from PIL import Image, UnidentifiedImageError
 
 from app import __version__
 from app.models import GenerateRequest, GenerateResponse, HealthResponse, JobStatus, JobStatusResponse, LoraListResponse, LoraProfileInfo
+from app.services.jobs import JobBusyError
 from app.utils.gpu import vram_snapshot
 
 router = APIRouter()
@@ -47,6 +48,8 @@ async def generate(body: GenerateRequest, request: Request):
         return manager.submit(body)
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
+    except JobBusyError as exc:
+        raise HTTPException(429, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(503, detail=str(exc)) from exc
     except asyncio.QueueFull as exc:
@@ -68,12 +71,35 @@ def get_job(job_id: str, request: Request):
 @router.get("/jobs/{job_id}/result")
 def get_result(job_id: str, request: Request):
     state = job_or_404(request, job_id)
+    if state.stage == "result_deleted":
+        raise HTTPException(410, detail="result file has been deleted")
     if state.status != JobStatus.COMPLETED or state.result is None:
         raise HTTPException(409, detail=f"job is {state.status.value}")
     path = Path(state.result.output_path)
     if not path.is_file():
         raise HTTPException(404, detail="result file no longer exists")
     return FileResponse(path, filename=state.result.filename, media_type="video/mp4", content_disposition_type="inline")
+
+
+@router.delete("/jobs/{job_id}/result", status_code=204)
+def delete_result(job_id: str, request: Request):
+    state = job_or_404(request, job_id)
+    if state.stage == "result_deleted":
+        return
+    if state.status != JobStatus.COMPLETED or state.result is None:
+        raise HTTPException(409, detail="only completed results can be deleted")
+    path = Path(state.result.output_path)
+    root = request.app.state.config.storage.default_output_dir.resolve()
+    if path.is_symlink() or path.name != state.result.filename or not path.resolve().is_relative_to(root):
+        raise HTTPException(409, detail="result path is outside the configured output directory")
+    if not path.is_file():
+        raise HTTPException(404, detail="result file no longer exists")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(500, detail="could not delete result file") from exc
+    state.result = None
+    state.stage = "result_deleted"
 
 
 @router.delete("/jobs/{job_id}", response_model=JobStatusResponse)
