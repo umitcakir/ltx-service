@@ -1,11 +1,17 @@
 #!/usr/bin/env sh
 set -eu
-if [ "${1:-}" != "" ] && [ "$1" != "--python-only" ]; then
-  printf '%s\n' 'Usage: sh setup.sh [--python-only]' >&2
+if [ "$#" -gt 1 ] || { [ "${1:-}" != "" ] && [ "$1" != "--python-only" ] && [ "$1" != "--start" ]; }; then
+  printf '%s\n' 'Usage: sh setup.sh [--python-only|--start]' >&2
   exit 2
 fi
 cd "$(dirname "$0")"
 project_dir=$(pwd -P)
+for source in app/models/__init__.py app/models/requests.py app/models/responses.py; do
+  if [ ! -f "$source" ]; then
+    printf 'Missing %s. Deploy the complete app/models source package before running setup.\n' "$source" >&2
+    exit 1
+  fi
+done
 bootstrap="$project_dir/.bootstrap"
 export UV_PYTHON_INSTALL_DIR="$project_dir/.python"
 if [ ! -x "$bootstrap/bin/uv" ]; then
@@ -32,4 +38,11 @@ else
   "$bootstrap/bin/uv" pip install --python "$venv/bin/python" torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
 fi
 "$bootstrap/bin/uv" pip install --python "$venv/bin/python" -r requirements.txt
-printf 'Accept the LTX-2.5 HF license, then run %s/bin/hf auth login and %s/bin/python run.py.\n' "$venv" "$venv"
+if [ "${1:-}" = "--start" ]; then
+  if ! "$venv/bin/hf" auth whoami >/dev/null 2>&1; then
+    printf '%s\n' 'Accept the LTX-2.5 Hugging Face license in your browser, then complete the login prompt.'
+    "$venv/bin/hf" auth login
+  fi
+  exec "$venv/bin/python" run.py
+fi
+printf 'Setup complete. Run sh setup.sh --start to log in if necessary and launch the service (or %s/bin/python run.py to launch directly).\n' "$venv"
