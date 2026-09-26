@@ -1,0 +1,69 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+  workers: 1
+  shutdown_grace_seconds: 60
+
+storage:
+  default_output_dir: ./outputs
+  allowed_output_dirs: [./outputs]
+  filename_pattern: "{date}_{uuid}_{resolution}.mp4"
+  allowed_formats: [mp4]
+  dated_subfolders: true
+
+model:
+  repo_id: Lightricks/LTX-2.5-Diffusers
+  checkpoint_path: ./models/ltx-2.5-diffusers
+  auto_download: true
+  device: cuda
+  precision: bf16
+  cpu_offload: sequential
+  vae_tiling: true
+  vae_slicing: true
+  enable_latent_upsampler: true
+  dry_run: false
+
+generation:
+  default_resolution: 720p
+  max_resolution: 720p
+  default_aspect_ratio: "16:9"
+  default_fps: 24
+  allowed_fps: [24, 25]
+  default_duration_seconds: 5
+  max_duration_seconds: 20
+  default_preset: fast
+  generate_audio_by_default: true
+  allow_remote_images: true
+  input_image_dir: ./inputs
+
+loras:
+  - name: fast
+    description: Distilled base transformer, reference 8-step sigma schedule
+    path: null
+    num_inference_steps: 8
+    guidance_scale: 1.0
+    sigma_schedule: distilled
+    multi_stage: false
+  - name: quality
+    description: Two-stage distilled refinement at 720p; 480p uses a single stage
+    path: null
+    num_inference_steps: 8
+    guidance_scale: 1.0
+    sigma_schedule: distilled
+    multi_stage: true
+    stage2_num_inference_steps: 3
+
+runtime:
+  max_concurrent_jobs: 1
+  job_timeout_seconds: 1800
+  max_queue_size: 32
+
+prompt_enhancer:
+  enabled: false
+  base_url: http://192.168.2.117:1234/v1
+  model: ministral-3-8b-instruct-2512
+  timeout_seconds: 30
+
+logging:
+  dir: ./logs
+  level: INFO
