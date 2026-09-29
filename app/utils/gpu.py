@@ -50,9 +50,13 @@ def empty_cache() -> None:
     torch = _torch()
     if torch is None or not torch.cuda.is_available():
         return
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    except RuntimeError:
+        # A poisoned CUDA context makes every call fail; nothing to reclaim.
+        pass
 
 
 def is_cuda_oom(exc: BaseException) -> bool:
@@ -64,6 +68,22 @@ def is_cuda_oom(exc: BaseException) -> bool:
             return True
     message = str(exc).lower()
     return "out of memory" in message or "cuda oom" in message
+
+
+_STICKY_CUDA_ERRORS = (
+    "launch timed out and was terminated",
+    "an illegal memory access was encountered",
+    "unspecified launch failure",
+    "device-side assert triggered",
+    "cuda error: unknown error",
+    "ecc uncorrectable",
+)
+
+
+def is_cuda_context_lost(exc: BaseException) -> bool:
+    """True for CUDA faults that poison the context for the rest of the process."""
+    message = str(exc).lower()
+    return any(marker in message for marker in _STICKY_CUDA_ERRORS)
 
 
 def resolve_dtype(precision: str) -> Any:

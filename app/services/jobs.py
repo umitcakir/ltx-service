@@ -15,7 +15,13 @@ from app.models.requests import GenerateRequest
 from app.models.responses import GenerateResponse, JobError, JobResult, JobStatus, JobStatusResponse
 from app.services.model_manager import GenerationSpec, ModelManager
 from app.services.prompt_enhancer import enhance_prompt
-from app.utils.gpu import empty_cache, is_cuda_oom, peak_vram_bytes, reset_peak_vram
+from app.utils.gpu import (
+    empty_cache,
+    is_cuda_context_lost,
+    is_cuda_oom,
+    peak_vram_bytes,
+    reset_peak_vram,
+)
 from app.utils.images import load_image_from_path, load_image_from_url
 from app.utils.logging_setup import job_log_context
 from app.utils.paths import OutputPathError, build_filename, resolve_input_image, resolve_output_path
@@ -72,6 +78,12 @@ class JobManager:
         self.queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=config.runtime.max_queue_size)
         self.workers: list[asyncio.Task] = []
         self.closing = False
+        # Set when a CUDA fault poisons the context; only a restart clears it.
+        self._cuda_context_lost = False
+
+    @property
+    def cuda_context_lost(self) -> bool:
+        return self._cuda_context_lost
 
     async def start(self) -> None:
         self.workers = [asyncio.create_task(self._worker()) for _ in range(self.config.runtime.max_concurrent_jobs)]
@@ -89,6 +101,10 @@ class JobManager:
     def submit(self, request: GenerateRequest) -> GenerateResponse:
         if self.closing:
             raise RuntimeError("server is shutting down")
+        if self._cuda_context_lost:
+            raise RuntimeError(
+                "the CUDA context was lost by a previous job; restart the service"
+            )
         validate_request(request, self.config)
         if self.config.runtime.reject_when_busy and any(
             job.state.status in (JobStatus.QUEUED, JobStatus.RUNNING) for job in self.jobs.values()
@@ -236,6 +252,9 @@ class JobManager:
                 elif is_cuda_oom(exc):
                     state.status, code = JobStatus.FAILED, "CUDA_OOM"
                     empty_cache()
+                elif is_cuda_context_lost(exc):
+                    state.status, code = JobStatus.FAILED, "CUDA_CONTEXT_LOST"
+                    self._cuda_context_lost = True
                 else:
                     state.status, code = JobStatus.FAILED, "GENERATION_FAILED"
                 state.stage = "failed"
