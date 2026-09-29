@@ -58,6 +58,7 @@ runtime:
   reject_when_busy: true
   job_timeout_seconds: 1800
   max_queue_size: 32
+  restart_on_cuda_context_lost: true
 
 prompt_enhancer:
   enabled: false

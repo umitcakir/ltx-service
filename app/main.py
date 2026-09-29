@@ -30,7 +30,9 @@ def create_app(config: AppConfig | None = None, *, model: ModelManager | None = 
             yield
         finally:
             await jobs.stop()
-            await asyncio.to_thread(instance.unload)
+            # A poisoned CUDA context fails every call; the process exit frees the GPU.
+            if not jobs.cuda_context_lost:
+                await asyncio.to_thread(instance.unload)
 
     app = FastAPI(title="LTX-2.5 Local API", version=__version__, lifespan=lifespan)
     app.include_router(router)

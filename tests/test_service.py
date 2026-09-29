@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from types import ModuleType
 import subprocess
 import sys
+import time
 
 import httpx
 import pytest
@@ -229,6 +230,32 @@ def test_failed_job_logs_elapsed_time(tmp_path, caplog):
     assert state.status == JobStatus.FAILED
     assert "job failed: GENERATION_FAILED elapsed=" in caplog.text
     assert "elapsed=" in (config.logging.dir / "jobs/timed.log").read_text()
+
+
+def test_cuda_context_lost_requests_restart(tmp_path, monkeypatch):
+    from app.services import jobs as jobs_module
+
+    config = load_config(ROOT / "config.yaml")
+    config.logging.dir = tmp_path / "logs"
+    model = FakeModel()
+
+    def fail(*args):
+        raise RuntimeError("CUDA error: the launch timed out and was terminated")
+
+    model.generate = fail
+    signals = []
+    monkeypatch.setattr(jobs_module, "restart_requested", False)
+    monkeypatch.setattr(jobs_module.signal, "raise_signal", signals.append)
+    with TestClient(create_app(config, model=model)) as client:
+        job_id = client.post("/generate", json={"prompt": "cat"}).json()["job_id"]
+        deadline = time.monotonic() + 5
+        while not signals and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert client.get(f"/jobs/{job_id}").json()["error"]["code"] == "CUDA_CONTEXT_LOST"
+        assert client.get("/health").json()["status"] == "cuda_context_lost"
+        assert client.post("/generate", json={"prompt": "cat"}).status_code == 503
+    assert signals == [jobs_module.signal.SIGTERM]
+    assert jobs_module.restart_requested is True
 
 
 def test_completed_job_logs_result_duration(tmp_path, monkeypatch, caplog):

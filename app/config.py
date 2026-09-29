@@ -220,6 +220,8 @@ class RuntimeConfig(BaseModel):
     max_queue_size: int = Field(default=32, ge=1)
     #: How long finished jobs stay queryable via /jobs/{id}.
     job_retention_seconds: float = Field(default=86400.0, gt=0)
+    #: Exit with RESTART_EXIT_CODE after a sticky CUDA fault so start.sh/systemd relaunches.
+    restart_on_cuda_context_lost: bool = True
 
 
 class PromptEnhancerConfig(BaseModel):

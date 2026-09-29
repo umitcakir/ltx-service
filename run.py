@@ -32,6 +32,10 @@ def main() -> None:
         log_level=config.server.log_level,
         timeout_graceful_shutdown=int(config.server.shutdown_grace_seconds),
     )
+    from app.services import jobs
+
+    if jobs.restart_requested:
+        sys.exit(jobs.RESTART_EXIT_CODE)
 
 
 if __name__ == "__main__":

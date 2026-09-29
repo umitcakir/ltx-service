@@ -11,6 +11,8 @@ FastAPI wrapper around the **Diffusers** LTX-2.5 pack. No containers. One Uvicor
 
 If a job reaches 100% denoising but reports `CUDA_OOM`, the VAE may still be decoding the video. Spatial and temporal VAE tiling are enabled when `model.vae_tiling` is true, but they cannot guarantee a long clip will fit alongside other GPU processes. Check `nvidia-smi` on the inference host before retrying, stop other GPU workloads you control, or use a shorter clip. The logged `peak_vram` is this process's PyTorch measurement, not total GPU usage.
 
+`CUDA_CONTEXT_LOST` with `the launch timed out and was terminated` means the NVIDIA driver's display watchdog killed a long kernel because the inference GPU also drives a desktop (`nvidia-smi` shows `Disp.A: On`). A lost context cannot be recovered in-process, so the service exits with code 75 (`runtime.restart_on_cuda_context_lost`) and `start.sh`/`start.bat` relaunch it; under systemd use `Restart=on-failure`. To stop the fault itself, run the host headless (`sudo systemctl set-default multi-user.target` and reboot), drive the display from another GPU, or add `Option "Interactive" "False"` to the NVIDIA `Device` section of `xorg.conf`. Shorter or lower-resolution clips reduce per-kernel time but do not remove the watchdog.
+
 ## Setup
 
 Windows PowerShell (Python 3.12 installed):

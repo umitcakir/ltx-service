@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import secrets
+import signal
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ from app.utils.logging_setup import job_log_context
 from app.utils.paths import OutputPathError, build_filename, resolve_input_image, resolve_output_path
 
 log = logging.getLogger(__name__)
+
+#: Process exit code telling start.sh / systemd that a restart is required.
+RESTART_EXIT_CODE = 75
+restart_requested = False
 
 
 def format_elapsed(seconds: float) -> str:
@@ -152,8 +157,18 @@ class JobManager:
                 job.state.started_at = utcnow()
                 job.state.stage = "preparing"
                 await asyncio.to_thread(self._execute, job)
+                if self._cuda_context_lost:
+                    self._request_restart()
             finally:
                 self.queue.task_done()
+
+    def _request_restart(self) -> None:
+        global restart_requested
+        if restart_requested or not self.config.runtime.restart_on_cuda_context_lost:
+            return
+        restart_requested = True
+        log.critical("CUDA context lost; shutting down so the service can be restarted (exit code %d)", RESTART_EXIT_CODE)
+        signal.raise_signal(signal.SIGTERM)
 
     def _load_image(self, url: object, path: str | None):
         if url:

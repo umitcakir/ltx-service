@@ -116,7 +116,8 @@ def health(request: Request):
     model = request.app.state.model
     jobs = request.app.state.jobs
     return HealthResponse(
-        status="ready" if model.is_loaded else "unavailable", version=__version__,
+        status="cuda_context_lost" if jobs.cuda_context_lost else "ready" if model.is_loaded else "unavailable",
+        version=__version__,
         model_loaded=model.is_loaded, model_repo_id=config.model.repo_id,
         device=config.model.device, precision=config.model.precision,
         cpu_offload=config.model.cpu_offload, loaded_lora=model.loaded_lora,

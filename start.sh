@@ -16,4 +16,10 @@ if [ -x "$venv/bin/hf" ] && ! "$venv/bin/hf" auth whoami >/dev/null 2>&1; then
   printf 'Not logged in to Hugging Face; run %s/bin/hf auth login if model weights still need downloading.\n' "$venv" >&2
 fi
 
-exec "$venv/bin/python" run.py "$@"
+while :; do
+  status=0
+  "$venv/bin/python" run.py "$@" || status=$?
+  [ "$status" -eq 75 ] || exit "$status"
+  printf 'CUDA context lost; restarting the service in 5 seconds...\n' >&2
+  sleep 5
+done
