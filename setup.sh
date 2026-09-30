@@ -43,6 +43,6 @@ if [ "${1:-}" = "--start" ]; then
     printf '%s\n' 'Accept the LTX-2.5 Hugging Face license in your browser, then complete the login prompt.'
     "$venv/bin/hf" auth login
   fi
-  exec "$venv/bin/python" run.py
+  exec "$project_dir/start.sh"
 fi
 printf 'Setup complete. Run sh setup.sh --start to log in if necessary and launch the service (or %s/bin/python run.py to launch directly).\n' "$venv"
