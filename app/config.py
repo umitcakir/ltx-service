@@ -112,8 +112,16 @@ class ModelConfig(BaseModel):
     device: Literal["cuda", "cpu", "mps"] = "cuda"
     precision: Literal["bf16", "fp16", "fp32"] = "bf16"
     #: "none" keeps everything resident; "model" and "sequential" stream weights
-    #: from system RAM. 22B bf16 does not fit in 16 GB, so "model" is the default.
+    #: from system RAM. A 22B transformer does not fit in 16 GB at bf16 (~44 GB)
+    #: or int8 (~22 GB), so "sequential" is the only workable mode on such cards.
     cpu_offload: Literal["none", "model", "sequential"] = "sequential"
+    #: int8 weight-only quantization of the transformer + text encoder. Halves the
+    #: per-step RAM->VRAM streaming under sequential offload at some quality cost.
+    quantization: Literal["none", "int8"] = "none"
+    #: Components to quantize when quantization is enabled.
+    quantize_components: list[str] = Field(
+        default_factory=lambda: ["transformer", "text_encoder"]
+    )
     vae_tiling: bool = True
     vae_slicing: bool = True
     #: Subfolder of the Diffusers pack holding the x2 latent upsampler.

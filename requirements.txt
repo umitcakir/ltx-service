@@ -10,4 +10,6 @@ accelerate>=1.7
 peft>=0.15
 imageio-ffmpeg>=0.6
 av>=14
+# Only needed when model.quantization is set to int8.
+torchao>=0.9
 diffusers @ git+https://github.com/huggingface/diffusers.git@main

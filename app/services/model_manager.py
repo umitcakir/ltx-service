@@ -111,9 +111,19 @@ class ModelManager:
             ) from exc
 
         dtype = resolve_dtype(model_cfg.precision)
-        logger.info("Loading LTX-2.5 from %s (dtype=%s)", checkpoint, model_cfg.precision)
+        logger.info(
+            "Loading LTX-2.5 from %s (dtype=%s, quantization=%s)",
+            checkpoint,
+            model_cfg.precision,
+            model_cfg.quantization,
+        )
 
-        pipeline = LTX2Pipeline.from_pretrained(str(checkpoint), dtype=dtype)
+        quant_config = self._build_quantization_config()
+        from_pretrained_kwargs: dict[str, Any] = {"dtype": dtype}
+        if quant_config is not None:
+            from_pretrained_kwargs["quantization_config"] = quant_config
+
+        pipeline = LTX2Pipeline.from_pretrained(str(checkpoint), **from_pretrained_kwargs)
 
         if model_cfg.cpu_offload == "model":
             pipeline.enable_model_cpu_offload()
@@ -139,12 +149,40 @@ class ModelManager:
                 raise ModelLoadError("Configured latent upsampler could not be loaded")
 
         logger.info(
-            "LTX-2.5 ready (device=%s, offload=%s, upsampler=%s)",
+            "LTX-2.5 ready (device=%s, offload=%s, quantization=%s, upsampler=%s)",
             model_cfg.device,
             model_cfg.cpu_offload,
+            model_cfg.quantization,
             self._upsample_pipeline is not None,
         )
         del torch
+
+    def _build_quantization_config(self) -> Any | None:
+        model_cfg = self._config.model
+        if model_cfg.quantization == "none":
+            return None
+
+        try:
+            from diffusers import PipelineQuantizationConfig  # noqa: PLC0415
+        except ImportError as exc:
+            raise ModelLoadError(
+                "model.quantization requires a diffusers build exposing "
+                "PipelineQuantizationConfig. Reinstall diffusers from main."
+            ) from exc
+
+        try:
+            import torchao  # noqa: F401, PLC0415
+        except ImportError as exc:
+            raise ModelLoadError(
+                "model.quantization='int8' requires torchao. Install it with:\n"
+                "  pip install torchao"
+            ) from exc
+
+        return PipelineQuantizationConfig(
+            quant_backend="torchao",
+            quant_kwargs={"quant_type": "int8_weight_only"},
+            components_to_quantize=list(model_cfg.quantize_components),
+        )
 
     def _ensure_checkpoint(self) -> Path:
         model_cfg = self._config.model

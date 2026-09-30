@@ -124,6 +124,7 @@ class HealthResponse(BaseModel):
     device: str
     precision: str
     cpu_offload: str
+    quantization: str
     loaded_lora: str | None
     available_loras: list[str]
     vram: VramInfo

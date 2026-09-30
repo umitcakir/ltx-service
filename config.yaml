@@ -18,13 +18,15 @@ model:
   device: cuda
   precision: bf16
   cpu_offload: sequential
+  # Set to int8 to halve RAM->VRAM streaming under sequential offload (needs torchao).
+  quantization: none
   vae_tiling: true
   vae_slicing: true
   enable_latent_upsampler: true
   dry_run: false
 
 generation:
-  default_resolution: 720p
+  default_resolution: 480p
   max_resolution: 720p
   default_aspect_ratio: "16:9"
   default_fps: 24
