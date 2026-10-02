@@ -258,6 +258,42 @@ def test_cuda_context_lost_requests_restart(tmp_path, monkeypatch):
     assert jobs_module.restart_requested is True
 
 
+RESTART_PROBE = """
+import signal, sys, threading, time
+import uvicorn
+from app.services import jobs
+import run
+
+async def app(scope, receive, send):
+    while True:
+        msg = await receive()
+        if msg["type"] == "lifespan.startup":
+            def trigger():
+                time.sleep(0.3)
+                jobs.restart_requested = True
+                signal.raise_signal(signal.SIGTERM)
+            threading.Thread(target=trigger, daemon=True).start()
+            await send({"type": "lifespan.startup.complete"})
+        else:
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+
+run.install_restart_handler(jobs)
+uvicorn.run(app, host="127.0.0.1", port=0, log_level="warning")
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_restart_request_exits_with_restart_code_under_uvicorn():
+    from app.services.jobs import RESTART_EXIT_CODE
+
+    # uvicorn re-raises the captured SIGTERM after shutdown; it must become exit 75.
+    result = subprocess.run(
+        [sys.executable, "-c", RESTART_PROBE], cwd=ROOT, timeout=30, capture_output=True
+    )
+    assert result.returncode == RESTART_EXIT_CODE, result.stderr.decode()
+
+
 def test_completed_job_logs_result_duration(tmp_path, monkeypatch, caplog):
     config = load_config(ROOT / "config.yaml")
     config.logging.dir = tmp_path / "logs"
