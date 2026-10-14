@@ -11,6 +11,8 @@ from __future__ import annotations
 import inspect
 import logging
 import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -73,6 +75,8 @@ class ModelManager:
         self._sigmas: dict[str, Any] = {}
         self._loaded_adapter: str | None = None
         self._loaded_adapter_weight: float | None = None
+        #: (adapter, prompt, negative prompt, cfg) -> encode_prompt outputs on CPU.
+        self._prompt_cache: OrderedDict[tuple, tuple] = OrderedDict()
         # Serialises adapter swaps and the denoising call. ``max_concurrent_jobs``
         # still overlaps image fetching, VAE decode-to-disk and encoding.
         self._lock = threading.RLock()
@@ -125,10 +129,25 @@ class ModelManager:
 
         pipeline = LTX2Pipeline.from_pretrained(str(checkpoint), **from_pretrained_kwargs)
 
+        if model_cfg.transformer_fp8_storage:
+            # Must precede offloading so the offload hooks move fp8 weights.
+            pipeline.transformer.enable_layerwise_casting(
+                storage_dtype=torch.float8_e4m3fn, compute_dtype=dtype
+            )
+        if model_cfg.attention_backend:
+            try:
+                pipeline.transformer.set_attention_backend(model_cfg.attention_backend)
+            except Exception as exc:
+                raise ModelLoadError(
+                    f"attention_backend '{model_cfg.attention_backend}' is unavailable: {exc}"
+                ) from exc
+
         if model_cfg.cpu_offload == "model":
             pipeline.enable_model_cpu_offload()
         elif model_cfg.cpu_offload == "sequential":
             pipeline.enable_sequential_cpu_offload()
+        elif model_cfg.cpu_offload == "group":
+            self._enable_group_offload(pipeline)
         else:
             pipeline.to(model_cfg.device)
 
@@ -156,6 +175,36 @@ class ModelManager:
             self._upsample_pipeline is not None,
         )
         del torch
+
+    def _group_offload_kwargs(self) -> dict[str, Any]:
+        import torch  # noqa: PLC0415
+
+        return {
+            "onload_device": torch.device(self._config.model.device),
+            "offload_device": torch.device("cpu"),
+            "use_stream": True,
+            "record_stream": True,
+            "low_cpu_mem_usage": self._config.model.group_offload_low_cpu_mem,
+        }
+
+    def _enable_group_offload(self, pipeline: Any) -> None:
+        """Stream offload with prefetch: the next group loads while the current one runs."""
+        import torch  # noqa: PLC0415
+        from diffusers.hooks import apply_group_offloading  # noqa: PLC0415
+
+        kwargs = self._group_offload_kwargs()
+        offload_type = self._config.model.group_offload_type
+        pipeline.transformer.enable_group_offload(
+            offload_type=offload_type,
+            num_blocks_per_group=1 if offload_type == "block_level" else None,
+            **kwargs,
+        )
+        # The text encoder's layers are nested below its top-level children, so
+        # block_level would onload it whole (~24 GB); leaf_level keeps it streamed.
+        for name, component in pipeline.components.items():
+            if name == "transformer" or not isinstance(component, torch.nn.Module):
+                continue
+            apply_group_offloading(component, offload_type="leaf_level", **kwargs)
 
     def _build_quantization_config(self) -> Any | None:
         model_cfg = self._config.model
@@ -219,6 +268,13 @@ class ModelManager:
             upsample_pipe = LTX2LatentUpsamplePipeline(vae=pipeline.vae, latent_upsampler=upsampler)
             if self._config.model.cpu_offload == "none":
                 upsample_pipe.to(self._config.model.device)
+            elif self._config.model.cpu_offload == "group":
+                # The shared VAE already carries group hooks; only the new model needs them.
+                from diffusers.hooks import apply_group_offloading  # noqa: PLC0415
+
+                apply_group_offloading(
+                    upsampler, offload_type="leaf_level", **self._group_offload_kwargs()
+                )
             else:
                 upsample_pipe.enable_model_cpu_offload(device=self._config.model.device)
             return upsample_pipe
@@ -248,6 +304,7 @@ class ModelManager:
             self._t2v_pipeline = None
             self._condition_pipeline = None
             self._upsample_pipeline = None
+            self._prompt_cache.clear()
             empty_cache()
 
     # -------------------------------------------------------------------- LoRA
@@ -319,13 +376,77 @@ class ModelManager:
             generator = torch.Generator(device="cpu" if device == "mps" else device)
             generator.manual_seed(spec.seed)
 
-            shared = self._build_kwargs(pipeline, spec, generator, progress)
+            timer = _StageTimer(sync=self._sync_fn())
+            shared = self._build_kwargs(pipeline, spec, generator, progress, timer)
+            if self._config.model.reuse_prompt_embeds:
+                with timer.stage("prompt_encode"):
+                    shared = self._with_prompt_embeds(pipeline, spec, shared)
 
             if spec.multi_stage and self._upsample_pipeline is not None:
-                return self._run_multi_stage(pipeline, spec, shared)
-            if spec.multi_stage:
+                output = self._run_multi_stage(pipeline, spec, shared, timer)
+            elif spec.multi_stage:
                 raise ModelLoadError("Multi-stage preset requires the latent upsampler")
-            return self._run_single_stage(pipeline, spec, shared)
+            else:
+                output = self._run_single_stage(pipeline, spec, shared, timer)
+            output.extras["timings"] = timer.timings
+            return output
+
+    def _sync_fn(self) -> Callable[[], None]:
+        """CUDA work is async; synchronise so stage timings land on the right stage."""
+        import torch  # noqa: PLC0415
+
+        if self._config.model.device.startswith("cuda") and torch.cuda.is_available():
+            return torch.cuda.synchronize
+        return lambda: None
+
+    def _with_prompt_embeds(
+        self, pipeline: Any, spec: GenerationSpec, shared: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Encode the prompt once and pass embeddings to every pipeline call.
+
+        Each pipeline call would otherwise run the large Gemma text encoder again;
+        the result is identical either way.
+        """
+        if not hasattr(pipeline, "encode_prompt"):
+            return shared
+        accepted = self._filter_supported(
+            pipeline, {"prompt_embeds": None, "prompt_attention_mask": None}
+        )
+        if len(accepted) != 2:
+            return shared
+
+        cfg = spec.guidance_scale > 1.0
+        negative = spec.negative_prompt if cfg else None
+        key = (self._loaded_adapter, spec.prompt, negative, cfg)
+        cached = self._prompt_cache.get(key)
+        device = pipeline._execution_device
+        if cached is not None:
+            self._prompt_cache.move_to_end(key)
+            encoded = tuple(t.to(device) if t is not None else None for t in cached)
+        else:
+            encoded = pipeline.encode_prompt(
+                prompt=spec.prompt,
+                negative_prompt=negative,
+                do_classifier_free_guidance=cfg,
+                device=device,
+            )
+            cache_size = self._config.model.prompt_cache_size
+            if cache_size > 0:
+                self._prompt_cache[key] = tuple(
+                    t.to("cpu") if t is not None else None for t in encoded
+                )
+                while len(self._prompt_cache) > cache_size:
+                    self._prompt_cache.popitem(last=False)
+
+        embeds, mask, negative_embeds, negative_mask = encoded
+        updated = {k: v for k, v in shared.items() if k not in ("prompt", "negative_prompt")}
+        updated.update(prompt_embeds=embeds, prompt_attention_mask=mask)
+        if cfg:
+            updated.update(
+                negative_prompt_embeds=negative_embeds,
+                negative_prompt_attention_mask=negative_mask,
+            )
+        return self._filter_supported(pipeline, updated)
 
     def _build_kwargs(
         self,
@@ -333,6 +454,7 @@ class ModelManager:
         spec: GenerationSpec,
         generator: Any,
         progress: ProgressCallback | None,
+        timer: "_StageTimer",
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "prompt": spec.prompt,
@@ -353,14 +475,15 @@ class ModelManager:
                       audio_stg_scale=0.0, modality_scale=1.0, audio_modality_scale=1.0,
                       min_seconds=1.0, max_seconds=float(self._config.generation.max_duration_seconds))
 
-        if progress is not None:
-            total = spec.num_inference_steps
+        total = spec.num_inference_steps
 
-            def _callback(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
+        def _callback(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
+            timer.step_end()
+            if progress is not None:
                 progress(step + 1, total, "denoise")
-                return callback_kwargs
+            return callback_kwargs
 
-            kwargs["callback_on_step_end"] = _callback
+        kwargs["callback_on_step_end"] = _callback
 
         return self._filter_supported(pipeline, kwargs)
 
@@ -385,7 +508,7 @@ class ModelManager:
         return self._sigmas.get(name)
 
     def _run_single_stage(
-        self, pipeline: Any, spec: GenerationSpec, shared: dict[str, Any]
+        self, pipeline: Any, spec: GenerationSpec, shared: dict[str, Any], timer: "_StageTimer"
     ) -> GenerationOutput:
         call_kwargs = dict(shared)
         call_kwargs.update(
@@ -406,11 +529,12 @@ class ModelManager:
         else:
             call_kwargs["num_inference_steps"] = spec.num_inference_steps
 
-        result = pipeline(**self._filter_supported(pipeline, call_kwargs))
+        with timer.pipeline_call("stage1"):
+            result = pipeline(**self._filter_supported(pipeline, call_kwargs))
         return self._to_output(result, spec)
 
     def _run_multi_stage(
-        self, pipeline: Any, spec: GenerationSpec, shared: dict[str, Any]
+        self, pipeline: Any, spec: GenerationSpec, shared: dict[str, Any], timer: "_StageTimer"
     ) -> GenerationOutput:
         """Stage 1 at half resolution, x2 latent upsample, then a short refine pass."""
         if spec.width % 64 or spec.height % 64:
@@ -437,12 +561,14 @@ class ModelManager:
         else:
             stage1_kwargs["num_inference_steps"] = spec.num_inference_steps
 
-        stage1 = pipeline(**self._filter_supported(pipeline, stage1_kwargs))
+        with timer.pipeline_call("stage1"):
+            stage1 = pipeline(**self._filter_supported(pipeline, stage1_kwargs))
         video_latents, audio_latents = self._split_result(stage1)
 
-        upsampled = self._upsample_pipeline(
-            latents=video_latents, latents_normalized=False, output_type="latent", return_dict=False
-        )[0]
+        with timer.stage("upsample"):
+            upsampled = self._upsample_pipeline(
+                latents=video_latents, latents_normalized=False, output_type="latent", return_dict=False
+            )[0]
 
         stage2_kwargs = dict(shared)
         stage2_kwargs.update(
@@ -465,7 +591,8 @@ class ModelManager:
         else:
             stage2_kwargs["num_inference_steps"] = spec.stage2_num_inference_steps
 
-        result = pipeline(**self._filter_supported(pipeline, stage2_kwargs))
+        with timer.pipeline_call("stage2"):
+            result = pipeline(**self._filter_supported(pipeline, stage2_kwargs))
         return self._to_output(result, spec)
 
     @staticmethod
@@ -497,3 +624,52 @@ class ModelManager:
             width=spec.width,
             height=spec.height,
         )
+
+
+class _StageTimer:
+    """Wall-clock seconds per generation stage, for comparing configurations.
+
+    A pipeline call is split at its last denoising step: ``<name>_denoise`` covers
+    setup plus every step (and prompt encoding when embeddings are not reused),
+    ``<name>_post`` covers what follows, i.e. VAE/audio decoding for pixel output.
+    """
+
+    def __init__(self, sync: Callable[[], None]) -> None:
+        self._sync = sync
+        self._last_step_end: float | None = None
+        self.timings: dict[str, float] = {}
+
+    def step_end(self) -> None:
+        self._sync()
+        self._last_step_end = time.perf_counter()
+
+    def stage(self, name: str) -> "_TimedBlock":
+        return _TimedBlock(self, name, split=False)
+
+    def pipeline_call(self, name: str) -> "_TimedBlock":
+        return _TimedBlock(self, name, split=True)
+
+
+class _TimedBlock:
+    def __init__(self, timer: _StageTimer, name: str, split: bool) -> None:
+        self._timer = timer
+        self._name = name
+        self._split = split
+
+    def __enter__(self) -> None:
+        self._timer._sync()
+        self._timer._last_step_end = None
+        self._start = time.perf_counter()
+
+    def __exit__(self, exc_type: Any, *_: Any) -> None:
+        if exc_type is not None:
+            return
+        self._timer._sync()
+        end = time.perf_counter()
+        timings = self._timer.timings
+        last_step = self._timer._last_step_end
+        if self._split and last_step is not None:
+            timings[f"{self._name}_denoise"] = round(last_step - self._start, 3)
+            timings[f"{self._name}_post"] = round(end - last_step, 3)
+        else:
+            timings[self._name] = round(end - self._start, 3)

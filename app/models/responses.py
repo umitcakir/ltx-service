@@ -49,6 +49,8 @@ class JobResult(BaseModel):
     audio: bool
     generation_time_seconds: float
     peak_vram_bytes: int | None = None
+    #: Seconds per stage (prompt_encode, stage1_denoise, upsample, mp4_encode, ...).
+    timings: dict[str, float] | None = None
 
 
 class JobError(BaseModel):

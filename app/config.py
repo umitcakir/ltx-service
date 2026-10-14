@@ -111,10 +111,29 @@ class ModelConfig(BaseModel):
     assets_repo_id: str = "Lightricks/LTX-2.5"
     device: Literal["cuda", "cpu", "mps"] = "cuda"
     precision: Literal["bf16", "fp16", "fp32"] = "bf16"
-    #: "none" keeps everything resident; "model" and "sequential" stream weights
-    #: from system RAM. A 22B transformer does not fit in 16 GB at bf16 (~44 GB)
-    #: or int8 (~22 GB), so "sequential" is the only workable mode on such cards.
-    cpu_offload: Literal["none", "model", "sequential"] = "sequential"
+    #: "none" keeps everything resident; "model", "sequential" and "group" stream
+    #: weights from system RAM. A 22B transformer does not fit in 16 GB at bf16
+    #: (~44 GB) or int8 (~22 GB), so "model" OOMs on such cards. "group" streams
+    #: like "sequential" but prefetches the next block on a CUDA stream while the
+    #: current one computes, so transfers overlap compute.
+    cpu_offload: Literal["none", "model", "sequential", "group"] = "sequential"
+    #: Granularity for the transformer under cpu_offload="group". Other components
+    #: always use "leaf_level" because their blocks are nested too deeply to split.
+    group_offload_type: Literal["block_level", "leaf_level"] = "block_level"
+    #: Pin weights on the fly instead of up front. Up-front pinning is faster but
+    #: needs a pinned copy of every offloaded weight in system RAM.
+    group_offload_low_cpu_mem: bool = True
+    #: Store transformer weights in fp8 and upcast per layer to ``precision`` for
+    #: compute. Halves RAM and RAM->VRAM traffic; benchmark quality before keeping.
+    transformer_fp8_storage: bool = False
+    #: Diffusers attention backend for the transformer, e.g. "flash" or "_flash_3"
+    #: (both need their packages installed). null keeps PyTorch SDPA.
+    attention_backend: str | None = None
+    #: Encode each prompt once per job and reuse it for both stages. Identical
+    #: output; saves a full text-encoder pass on multi-stage presets.
+    reuse_prompt_embeds: bool = True
+    #: Recent prompt encodings kept in system RAM across jobs (~0.4 GB each).
+    prompt_cache_size: int = Field(default=2, ge=0)
     #: int8 weight-only quantization of the transformer + text encoder. Halves the
     #: per-step RAM->VRAM streaming under sequential offload at some quality cost.
     quantization: Literal["none", "int8"] = "none"
@@ -130,6 +149,14 @@ class ModelConfig(BaseModel):
     enable_latent_upsampler: bool = True
     #: Skip model loading entirely — useful for smoke-testing the API surface.
     dry_run: bool = False
+
+    @model_validator(mode="after")
+    def _compatible_weight_formats(self) -> "ModelConfig":
+        if self.transformer_fp8_storage and self.quantization != "none" and "transformer" in self.quantize_components:
+            raise ValueError(
+                "model.transformer_fp8_storage cannot be combined with quantizing the transformer"
+            )
+        return self
 
 
 class GenerationConfig(BaseModel):

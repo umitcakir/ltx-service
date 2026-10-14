@@ -232,6 +232,8 @@ class JobManager:
                 reset_peak_vram()
                 generated = self.model.generate(spec, profile, weight, progress)
                 progress(1, 1, "encoding")
+                timings = dict(generated.extras.get("timings", {}))
+                encode_started = time.monotonic()
                 from diffusers.utils import encode_video
 
                 encode_video(
@@ -242,6 +244,7 @@ class JobManager:
                 from app.utils.videos import make_faststart
 
                 make_faststart(output_path)
+                timings["mp4_encode"] = round(time.monotonic() - encode_started, 3)
                 duration = duration_for_frames(generated.num_frames, fps)
                 state.result = JobResult(
                     output_path=str(output_path), filename=filename, format=output_path.suffix.lstrip("."),
@@ -254,11 +257,19 @@ class JobManager:
                     multi_stage=spec.multi_stage, audio=generated.audio is not None,
                     generation_time_seconds=round(time.monotonic() - started, 3),
                     peak_vram_bytes=peak_vram_bytes(),
+                    timings=timings,
                 )
                 state.status = JobStatus.COMPLETED
                 state.progress = 1.0
                 state.stage = "completed"
                 job_log.info("completed in %s peak_vram=%s path=%s", format_elapsed(state.result.generation_time_seconds), state.result.peak_vram_bytes, output_path)
+                job_log.info(
+                    "timings offload=%s quantization=%s fp8=%s attention=%s reuse_prompt=%s %s",
+                    self.config.model.cpu_offload, self.config.model.quantization,
+                    self.config.model.transformer_fp8_storage, self.config.model.attention_backend or "sdpa",
+                    self.config.model.reuse_prompt_embeds,
+                    " ".join(f"{name}={seconds:.2f}s" for name, seconds in timings.items()),
+                )
             except Exception as exc:
                 if output_path is not None and output_path.is_file():
                     output_path.unlink(missing_ok=True)

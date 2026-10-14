@@ -94,6 +94,7 @@ def test_reject_when_busy_queued_and_cancelled():
 def test_model_load_enables_temporal_vae_tiling(monkeypatch, tmp_path):
     config = load_config(ROOT / "config.yaml")
     config.model.enable_latent_upsampler = False
+    config.model.cpu_offload = "sequential"
     vae = SimpleNamespace(use_framewise_decoding=False, enable_tiling=lambda: None, enable_slicing=lambda: None)
     pipeline = SimpleNamespace(vae=vae, enable_sequential_cpu_offload=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
@@ -105,6 +106,52 @@ def test_model_load_enables_temporal_vae_tiling(monkeypatch, tmp_path):
     manager = ModelManager(config)
     manager.load()
     assert vae.use_framewise_decoding is True
+
+
+def test_multi_stage_encodes_prompt_once_and_records_timings():
+    torch = pytest.importorskip("torch")
+    from app.services.model_manager import GenerationSpec
+
+    config = load_config(ROOT / "config.yaml")
+    config.model.device = "cpu"
+    calls, encodes = [], []
+
+    class FakePipeline:
+        vae_temporal_compression_ratio = 8
+        _execution_device = torch.device("cpu")
+
+        def encode_prompt(self, prompt, negative_prompt, do_classifier_free_guidance, device):
+            encodes.append(prompt)
+            return torch.ones(1, 4, 2), torch.ones(1, 4), None, None
+
+        def __call__(self, prompt=None, negative_prompt=None, prompt_embeds=None,
+                     prompt_attention_mask=None, height=None, width=None, num_frames=None,
+                     guidance_scale=None, generator=None, output_type=None, return_dict=True,
+                     callback_on_step_end=None, latents=None, audio_latents=None, sigmas=None,
+                     num_inference_steps=None, noise_scale=None):
+            assert prompt is None and prompt_embeds is not None
+            calls.append(output_type)
+            callback_on_step_end(self, 0, None, {})
+            if output_type == "latent":
+                return torch.zeros(1, 1, 2, 1, 1), None
+            return [torch.zeros(9, 2, 2, 3)], None
+
+    manager = ModelManager(config)
+    manager._pipeline = FakePipeline()
+    manager._upsample_pipeline = lambda **kwargs: [kwargs["latents"]]
+    profile = config.profile("quality")
+    spec = GenerationSpec(
+        prompt="cat", negative_prompt="", width=1280, height=704, num_frames=9, fps=24, seed=1,
+        guidance_scale=1.0, num_inference_steps=8, sigma_schedule="none", multi_stage=True,
+        stage2_num_inference_steps=3, generate_audio=False,
+    )
+    output = manager.generate(spec, profile, profile.default_weight)
+    assert calls == ["latent", "np"]
+    assert encodes == ["cat"]
+    assert {"prompt_encode", "stage1_denoise", "upsample", "stage2_denoise", "stage2_post"} <= set(output.extras["timings"])
+
+    manager.generate(spec, profile, profile.default_weight)
+    assert encodes == ["cat"]  # served from the cross-job prompt cache
 
 
 def test_output_path_and_symlink_escape(tmp_path):

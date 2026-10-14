@@ -17,9 +17,21 @@ model:
   auto_download: true
   device: cuda
   precision: bf16
-  cpu_offload: sequential
+  # group: streamed offload that prefetches the next block while the current one
+  # runs. Set back to sequential to compare against the previous behaviour.
+  cpu_offload: group
+  group_offload_type: block_level
+  # false pins all offloaded weights up front: faster, but needs that much extra RAM.
+  group_offload_low_cpu_mem: true
   # Set to int8 to halve RAM->VRAM streaming under sequential offload (needs torchao).
   quantization: none
+  # fp8 weight storage with bf16 compute; near-lossless, halves RAM and transfer.
+  transformer_fp8_storage: false
+  # e.g. flash (needs flash-attn installed); null uses PyTorch SDPA.
+  attention_backend: null
+  # Encode the prompt once per job instead of once per stage (identical output).
+  reuse_prompt_embeds: true
+  prompt_cache_size: 2
   vae_tiling: true
   vae_slicing: true
   enable_latent_upsampler: true
