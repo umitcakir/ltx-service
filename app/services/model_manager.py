@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.config import AppConfig, LoraProfile
-from app.utils.gpu import empty_cache, resolve_dtype
+from app.utils.gpu import allocated_vram_bytes, empty_cache, resolve_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -168,43 +168,77 @@ class ModelManager:
                 raise ModelLoadError("Configured latent upsampler could not be loaded")
 
         logger.info(
-            "LTX-2.5 ready (device=%s, offload=%s, quantization=%s, upsampler=%s)",
+            "LTX-2.5 ready (device=%s, offload=%s, quantization=%s, upsampler=%s, vram_allocated=%s)",
             model_cfg.device,
             model_cfg.cpu_offload,
             model_cfg.quantization,
             self._upsample_pipeline is not None,
+            allocated_vram_bytes(),
         )
         del torch
 
-    def _group_offload_kwargs(self) -> dict[str, Any]:
+    def _group_offload_kwargs(self, streamed: bool) -> dict[str, Any]:
         import torch  # noqa: PLC0415
 
-        return {
+        kwargs: dict[str, Any] = {
             "onload_device": torch.device(self._config.model.device),
             "offload_device": torch.device("cpu"),
-            "use_stream": True,
-            "record_stream": True,
-            "low_cpu_mem_usage": self._config.model.group_offload_low_cpu_mem,
         }
+        if streamed:
+            kwargs.update(
+                use_stream=True,
+                record_stream=True,
+                low_cpu_mem_usage=self._config.model.group_offload_low_cpu_mem,
+            )
+        return kwargs
 
     def _enable_group_offload(self, pipeline: Any) -> None:
-        """Stream offload with prefetch: the next group loads while the current one runs."""
+        """Prefetching stream offload for the transformer, synchronous for the rest.
+
+        Only the transformer runs enough passes (every denoising step) for
+        prefetching to pay off. The text encoder runs once per job, and streamed
+        offload of it piled up ~14 GB of VRAM on a 16 GB card during its first
+        pass; diffusers also warns streams misbehave on a tiled VAE.
+        """
         import torch  # noqa: PLC0415
         from diffusers.hooks import apply_group_offloading  # noqa: PLC0415
 
-        kwargs = self._group_offload_kwargs()
         offload_type = self._config.model.group_offload_type
         pipeline.transformer.enable_group_offload(
             offload_type=offload_type,
             num_blocks_per_group=1 if offload_type == "block_level" else None,
-            **kwargs,
+            **self._group_offload_kwargs(streamed=True),
         )
         # The text encoder's layers are nested below its top-level children, so
-        # block_level would onload it whole (~24 GB); leaf_level keeps it streamed.
+        # block_level would onload it whole (~24 GB); leaf_level moves one layer at a time.
         for name, component in pipeline.components.items():
             if name == "transformer" or not isinstance(component, torch.nn.Module):
                 continue
-            apply_group_offloading(component, offload_type="leaf_level", **kwargs)
+            apply_group_offloading(
+                component, offload_type="leaf_level", **self._group_offload_kwargs(streamed=False)
+            )
+
+    def reclaim_offloaded_vram(self) -> None:
+        """Return group-offloaded weights stranded on the GPU to the CPU.
+
+        Group hooks offload a block in its post-forward, so an exception mid-pass
+        leaves the blocks it had loaded or prefetched resident for later jobs.
+        """
+        if self._config.model.cpu_offload != "group" or self._pipeline is None:
+            return
+        import torch  # noqa: PLC0415
+
+        modules = [c for c in self._pipeline.components.values() if isinstance(c, torch.nn.Module)]
+        if self._upsample_pipeline is not None:
+            modules.append(self._upsample_pipeline.latent_upsampler)
+        with self._lock:
+            for component in modules:
+                for submodule in component.modules():
+                    registry = getattr(submodule, "_diffusers_hook", None)
+                    hook = registry.get_hook("group_offloading") if registry is not None else None
+                    if hook is not None:
+                        hook.group.offload_()
+        empty_cache()
 
     def _build_quantization_config(self) -> Any | None:
         model_cfg = self._config.model
@@ -273,7 +307,7 @@ class ModelManager:
                 from diffusers.hooks import apply_group_offloading  # noqa: PLC0415
 
                 apply_group_offloading(
-                    upsampler, offload_type="leaf_level", **self._group_offload_kwargs()
+                    upsampler, offload_type="leaf_level", **self._group_offload_kwargs(streamed=False)
                 )
             else:
                 upsample_pipe.enable_model_cpu_offload(device=self._config.model.device)

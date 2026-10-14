@@ -17,6 +17,7 @@ from app.models.responses import GenerateResponse, JobError, JobResult, JobStatu
 from app.services.model_manager import GenerationSpec, ModelManager
 from app.services.prompt_enhancer import enhance_prompt
 from app.utils.gpu import (
+    allocated_vram_bytes,
     empty_cache,
     is_cuda_context_lost,
     is_cuda_oom,
@@ -170,6 +171,15 @@ class JobManager:
         log.critical("CUDA context lost; shutting down so the service can be restarted (exit code %d)", RESTART_EXIT_CODE)
         signal.raise_signal(signal.SIGTERM)
 
+    def _reclaim_vram(self, job_log: logging.Logger) -> None:
+        """Free VRAM a failed job left behind so the next job starts clean."""
+        try:
+            self.model.reclaim_offloaded_vram()
+        except Exception:
+            job_log.exception("could not reclaim offloaded weights after failure")
+            empty_cache()
+        job_log.info("vram after failure cleanup: allocated=%s", allocated_vram_bytes())
+
     def _load_image(self, url: object, path: str | None):
         if url:
             return load_image_from_url(str(url), max_bytes=self.config.generation.max_image_download_bytes)
@@ -230,6 +240,7 @@ class JobManager:
                 if time.monotonic() > deadline:
                     raise TimeoutError("job timed out during preparation")
                 reset_peak_vram()
+                job_log.info("vram before generation: allocated=%s", allocated_vram_bytes())
                 generated = self.model.generate(spec, profile, weight, progress)
                 progress(1, 1, "encoding")
                 timings = dict(generated.extras.get("timings", {}))
@@ -275,14 +286,16 @@ class JobManager:
                     output_path.unlink(missing_ok=True)
                 if isinstance(exc, TimeoutError):
                     state.status, code = JobStatus.TIMEOUT, "TIMEOUT"
+                    self._reclaim_vram(job_log)
                 elif is_cuda_oom(exc):
                     state.status, code = JobStatus.FAILED, "CUDA_OOM"
-                    empty_cache()
+                    self._reclaim_vram(job_log)
                 elif is_cuda_context_lost(exc):
                     state.status, code = JobStatus.FAILED, "CUDA_CONTEXT_LOST"
                     self._cuda_context_lost = True
                 else:
                     state.status, code = JobStatus.FAILED, "GENERATION_FAILED"
+                    self._reclaim_vram(job_log)
                 state.stage = "failed"
                 state.error = JobError(code=code, message=str(exc)[:500])
                 job_log.exception("job failed: %s elapsed=%s (peak_vram=%s)", code, format_elapsed(time.monotonic() - started), peak_vram_bytes())

@@ -209,6 +209,9 @@ class FakeModel:
     def unload(self):
         pass
 
+    def reclaim_offloaded_vram(self):
+        pass
+
     def generate(self, *args, **kwargs):
         raise RuntimeError("test model has no inference")
 

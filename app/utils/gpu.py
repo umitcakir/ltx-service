@@ -46,6 +46,14 @@ def peak_vram_bytes() -> int | None:
     return int(torch.cuda.max_memory_allocated())
 
 
+def allocated_vram_bytes() -> int | None:
+    torch = _torch()
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        return None
+    return int(cuda.memory_allocated())
+
+
 def empty_cache() -> None:
     torch = _torch()
     if torch is None or not torch.cuda.is_available():
