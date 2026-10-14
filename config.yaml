@@ -76,7 +76,7 @@ runtime:
 
 prompt_enhancer:
   enabled: false
-  base_url: http://192.168.2.117:1234/v1
+  base_url: http://192.168.2.56:1234/v1
   model: ministral-3-8b-instruct-2512
   timeout_seconds: 30
 

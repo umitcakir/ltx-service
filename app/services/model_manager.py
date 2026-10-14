@@ -196,9 +196,8 @@ class ModelManager:
         """Prefetching stream offload for the transformer, synchronous for the rest.
 
         Only the transformer runs enough passes (every denoising step) for
-        prefetching to pay off. The text encoder runs once per job, and streamed
-        offload of it piled up ~14 GB of VRAM on a 16 GB card during its first
-        pass; diffusers also warns streams misbehave on a tiled VAE.
+        prefetching to pay off; the text encoder runs once per job, and diffusers
+        warns that streams misbehave on a tiled VAE.
         """
         import torch  # noqa: PLC0415
         from diffusers.hooks import apply_group_offloading  # noqa: PLC0415
@@ -397,7 +396,10 @@ class ModelManager:
 
         import torch  # noqa: PLC0415
 
-        with self._lock:
+        # Pipeline __call__ disables grad itself, but encode_prompt and the stage
+        # glue run outside it; with grad on, autograd keeps every offloaded layer's
+        # GPU weights alive and the text encoder alone exhausts 16 GB.
+        with self._lock, torch.no_grad():
             self.apply_profile(profile, weight)
             pipeline = self._require_pipeline()
             if spec.start_image is not None:

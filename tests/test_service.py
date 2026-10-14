@@ -121,6 +121,7 @@ def test_multi_stage_encodes_prompt_once_and_records_timings():
         _execution_device = torch.device("cpu")
 
         def encode_prompt(self, prompt, negative_prompt, do_classifier_free_guidance, device):
+            assert not torch.is_grad_enabled()
             encodes.append(prompt)
             return torch.ones(1, 4, 2), torch.ones(1, 4), None, None
 
