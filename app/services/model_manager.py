@@ -193,11 +193,14 @@ class ModelManager:
         return kwargs
 
     def _enable_group_offload(self, pipeline: Any) -> None:
-        """Prefetching stream offload for the transformer, synchronous for the rest.
+        """Prefetching stream offload, synchronous only for the tiled VAE.
 
-        Only the transformer runs enough passes (every denoising step) for
-        prefetching to pay off; the text encoder runs once per job, and diffusers
-        warns that streams misbehave on a tiled VAE.
+        Weights load memory-mapped from the safetensors files. Streamed offload
+        restores those original CPU tensors after each use, so they stay
+        file-backed and reclaimable. Synchronous offload copies each layer back
+        with ``.to("cpu")``, turning the text encoder (~24 GB) into anonymous RAM
+        after one pass, which got the process OOM-killed. diffusers warns streams
+        misbehave on a tiled VAE, and its ~1.5 GB copy is affordable.
         """
         import torch  # noqa: PLC0415
         from diffusers.hooks import apply_group_offloading  # noqa: PLC0415
@@ -214,7 +217,9 @@ class ModelManager:
             if name == "transformer" or not isinstance(component, torch.nn.Module):
                 continue
             apply_group_offloading(
-                component, offload_type="leaf_level", **self._group_offload_kwargs(streamed=False)
+                component,
+                offload_type="leaf_level",
+                **self._group_offload_kwargs(streamed=name != "vae"),
             )
 
     def reclaim_offloaded_vram(self) -> None:

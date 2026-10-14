@@ -21,7 +21,8 @@ model:
   # runs. Set back to sequential to compare against the previous behaviour.
   cpu_offload: group
   group_offload_type: block_level
-  # false pins all offloaded weights up front: faster, but needs that much extra RAM.
+  # false pins all offloaded weights up front: faster, but needs a second, locked
+  # copy of the whole model (~80 GB) in RAM. Keep true unless RAM is far larger.
   group_offload_low_cpu_mem: true
   # Set to int8 to halve RAM->VRAM streaming under sequential offload (needs torchao).
   quantization: none
