@@ -28,8 +28,9 @@ model:
   # tensor cores). Faster compute-bound denoising, small quality cost; compare videos.
   # int8: weight-only, saves memory but does not speed up compute. Both need torchao.
   quantization: float8
-  # row = better quality; switch to tensor if row-wise fp8 kernels are unavailable.
-  float8_granularity: row
+  # row = better quality, but torch 2.7.1 has no row-wise fp8 kernels for the
+  # 5070 Ti ("Rowwise scaling is not currently supported on your device").
+  float8_granularity: tensor
   # fp8 weight storage with bf16 compute; near-lossless, halves RAM and transfer.
   transformer_fp8_storage: false
   # e.g. flash (needs flash-attn installed); null uses PyTorch SDPA.
