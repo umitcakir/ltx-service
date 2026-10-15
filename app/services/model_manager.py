@@ -241,6 +241,9 @@ class ModelManager:
                 offload_type="leaf_level",
                 **self._group_offload_kwargs(streamed=name != "vae"),
             )
+        for component in pipeline.components.values():
+            if isinstance(component, torch.nn.Module):
+                _decouple_torchao_cpu_copies(component)
 
     def reclaim_offloaded_vram(self) -> None:
         """Return group-offloaded weights stranded on the GPU to the CPU.
@@ -705,6 +708,29 @@ class ModelManager:
             width=spec.width,
             height=spec.height,
         )
+
+
+def _decouple_torchao_cpu_copies(module: Any) -> None:
+    """Give streamed torchao weights a CPU copy that is not the parameter itself.
+
+    With ``low_cpu_mem_usage`` diffusers keeps ``tensor.cpu()`` as each weight's
+    CPU copy, which for a torchao tensor already on the CPU is the parameter
+    object. Onloading swaps the parameter's contents to CUDA in place, so the
+    "CPU copy" moves too, offloading becomes a no-op and the next onload fails
+    with "cannot pin ... only dense CPU tensors can be pinned". ``detach()``
+    returns a separate wrapper over the same CPU storage, so this costs no RAM.
+    """
+    from diffusers.hooks.group_offloading import _is_torchao_tensor  # noqa: PLC0415
+
+    for submodule in module.modules():
+        registry = getattr(submodule, "_diffusers_hook", None)
+        hook = registry.get_hook("group_offloading") if registry is not None else None
+        if hook is None:
+            continue
+        cpu_copies = hook.group.cpu_param_dict
+        for tensor, cpu_copy in list(cpu_copies.items()):
+            if cpu_copy is tensor and _is_torchao_tensor(tensor):
+                cpu_copies[tensor] = cpu_copy.detach()
 
 
 class _StageTimer:

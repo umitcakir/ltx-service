@@ -95,6 +95,7 @@ def test_model_load_enables_temporal_vae_tiling(monkeypatch, tmp_path):
     config = load_config(ROOT / "config.yaml")
     config.model.enable_latent_upsampler = False
     config.model.cpu_offload = "sequential"
+    config.model.quantization = "none"
     vae = SimpleNamespace(use_framewise_decoding=False, enable_tiling=lambda: None, enable_slicing=lambda: None)
     pipeline = SimpleNamespace(vae=vae, enable_sequential_cpu_offload=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
