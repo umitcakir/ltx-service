@@ -24,6 +24,26 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int, str], None]
 
+#: Transformer modules outside the repeated blocks: input/output projections and
+#: timestep/caption embeddings. They are a sliver of the compute but sit at the
+#: model's edges where fp8 rounding hurts most, so they stay in bf16.
+_FP8_KEEP_BF16 = (
+    "proj_in",
+    "audio_proj_in",
+    "proj_out",
+    "audio_proj_out",
+    "caption_projection",
+    "audio_caption_projection",
+    "time_embed",
+    "audio_time_embed",
+    "av_cross_attn_video_scale_shift",
+    "av_cross_attn_audio_scale_shift",
+    "av_cross_attn_video_a2v_gate",
+    "av_cross_attn_audio_v2a_gate",
+    "prompt_adaln",
+    "audio_prompt_adaln",
+)
+
 
 class ModelNotLoadedError(RuntimeError):
     pass
@@ -251,6 +271,8 @@ class ModelManager:
 
         try:
             from diffusers import PipelineQuantizationConfig  # noqa: PLC0415
+            from diffusers import TorchAoConfig as DiffusersTorchAoConfig  # noqa: PLC0415
+            from transformers import TorchAoConfig as TransformersTorchAoConfig  # noqa: PLC0415
         except ImportError as exc:
             raise ModelLoadError(
                 "model.quantization requires a diffusers build exposing "
@@ -258,18 +280,36 @@ class ModelManager:
             ) from exc
 
         try:
-            import torchao  # noqa: F401, PLC0415
+            from torchao.quantization import (  # noqa: PLC0415
+                Float8DynamicActivationFloat8WeightConfig,
+                Int8WeightOnlyConfig,
+                PerRow,
+                PerTensor,
+            )
         except ImportError as exc:
             raise ModelLoadError(
-                "model.quantization='int8' requires torchao. Install it with:\n"
-                "  pip install torchao"
+                f"model.quantization='{model_cfg.quantization}' requires a torchao build "
+                f"compatible with the installed torch: {exc}"
             ) from exc
 
-        return PipelineQuantizationConfig(
-            quant_backend="torchao",
-            quant_kwargs={"quant_type": "int8_weight_only"},
-            components_to_quantize=list(model_cfg.quantize_components),
-        )
+        if model_cfg.quantization == "float8":
+            granularity = PerRow() if model_cfg.float8_granularity == "row" else PerTensor()
+            fp8 = Float8DynamicActivationFloat8WeightConfig(granularity=granularity)
+            return PipelineQuantizationConfig(
+                quant_mapping={
+                    "transformer": DiffusersTorchAoConfig(
+                        fp8, modules_to_not_convert=list(_FP8_KEEP_BF16)
+                    )
+                }
+            )
+
+        mapping: dict[str, Any] = {}
+        for name in model_cfg.quantize_components:
+            if name == "transformer":
+                mapping[name] = DiffusersTorchAoConfig(Int8WeightOnlyConfig())
+            else:
+                mapping[name] = TransformersTorchAoConfig(quant_type=Int8WeightOnlyConfig())
+        return PipelineQuantizationConfig(quant_mapping=mapping)
 
     def _ensure_checkpoint(self) -> Path:
         model_cfg = self._config.model

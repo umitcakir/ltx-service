@@ -24,8 +24,12 @@ model:
   # false pins all offloaded weights up front: faster, but needs a second, locked
   # copy of the whole model (~80 GB) in RAM. Keep true unless RAM is far larger.
   group_offload_low_cpu_mem: true
-  # Set to int8 to halve RAM->VRAM streaming under sequential offload (needs torchao).
-  quantization: none
+  # float8: fp8 weights + fp8 matmuls in the transformer blocks (5070 Ti has fp8
+  # tensor cores). Faster compute-bound denoising, small quality cost; compare videos.
+  # int8: weight-only, saves memory but does not speed up compute. Both need torchao.
+  quantization: float8
+  # row = better quality; switch to tensor if row-wise fp8 kernels are unavailable.
+  float8_granularity: row
   # fp8 weight storage with bf16 compute; near-lossless, halves RAM and transfer.
   transformer_fp8_storage: false
   # e.g. flash (needs flash-attn installed); null uses PyTorch SDPA.

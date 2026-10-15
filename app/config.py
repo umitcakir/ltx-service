@@ -134,10 +134,16 @@ class ModelConfig(BaseModel):
     reuse_prompt_embeds: bool = True
     #: Recent prompt encodings kept in system RAM across jobs (~0.4 GB each).
     prompt_cache_size: int = Field(default=2, ge=0)
-    #: int8 weight-only quantization of the transformer + text encoder. Halves the
-    #: per-step RAM->VRAM streaming under sequential offload at some quality cost.
-    quantization: Literal["none", "int8"] = "none"
-    #: Components to quantize when quantization is enabled.
+    #: "float8": fp8 weights *and* fp8 matmuls in the transformer blocks (needs a
+    #: GPU with fp8 tensor cores, compute capability >= 8.9). Speeds up compute-
+    #: bound denoising and halves transformer RAM; small quality cost.
+    #: "int8": int8 weight-only for ``quantize_components``; saves memory and
+    #: transfer but computes in bf16, so it does not speed up a compute-bound GPU.
+    quantization: Literal["none", "int8", "float8"] = "none"
+    #: fp8 scaling granularity: "row" (per output row, better quality) or
+    #: "tensor" (one scale per tensor; fallback if row-wise kernels are missing).
+    float8_granularity: Literal["row", "tensor"] = "row"
+    #: Components to quantize when quantization is "int8".
     quantize_components: list[str] = Field(
         default_factory=lambda: ["transformer", "text_encoder"]
     )
@@ -152,7 +158,10 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def _compatible_weight_formats(self) -> "ModelConfig":
-        if self.transformer_fp8_storage and self.quantization != "none" and "transformer" in self.quantize_components:
+        quantizes_transformer = self.quantization == "float8" or (
+            self.quantization == "int8" and "transformer" in self.quantize_components
+        )
+        if self.transformer_fp8_storage and quantizes_transformer:
             raise ValueError(
                 "model.transformer_fp8_storage cannot be combined with quantizing the transformer"
             )
