@@ -42,6 +42,14 @@ _FP8_KEEP_BF16 = (
     "av_cross_attn_audio_v2a_gate",
     "prompt_adaln",
     "audio_prompt_adaln",
+    # Audio-path layers inside each block. Audio runs ~300 tokens for 12 s
+    # against ~15k video tokens, so fp8 buys almost no speed there, while
+    # speech pacing and lip sync depend on exactly these layers.
+    "audio_attn1",
+    "audio_attn2",
+    "audio_ff",
+    "audio_to_video_attn",
+    "video_to_audio_attn",
 )
 
 
