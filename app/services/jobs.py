@@ -281,6 +281,12 @@ class JobManager:
                     self.config.model.reuse_prompt_embeds,
                     " ".join(f"{name}={seconds:.2f}s" for name, seconds in timings.items()),
                 )
+                # Hand cached VRAM back between jobs. On a host whose GPU also drives
+                # a desktop, keeping ~15 GB reserved while idle starves Xorg and the
+                # remote-desktop encoder, which stalls the GPU and trips the driver
+                # watchdog (Xid 8) on the next job. Costs ~1 s of re-allocation.
+                empty_cache()
+                job_log.info("vram after release: allocated=%s", allocated_vram_bytes())
             except Exception as exc:
                 if output_path is not None and output_path.is_file():
                     output_path.unlink(missing_ok=True)
